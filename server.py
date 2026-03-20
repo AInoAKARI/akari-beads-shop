@@ -7,27 +7,13 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
+from keymaster import get_key
+from webhook_handler import router as webhook_router
+
 app = FastAPI(title="Akari Beads Shop")
 
-KEYMASTER_URL = os.environ.get("AKARI_KEYMASTER_URL", "")
-KEYMASTER_TOKEN = os.environ.get("AKARI_KEYMASTER_TOKEN", "")
 SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "")
-
-
-async def get_shopify_api_key() -> str:
-    """Fetch Shopify API key from Keymaster at runtime."""
-    if not KEYMASTER_URL or not KEYMASTER_TOKEN:
-        raise HTTPException(status_code=500, detail="Keymaster not configured")
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{KEYMASTER_URL}/vault/api-key",
-            params={"api_name": "shopify", "key_name": "api_key"},
-            headers={"Authorization": f"Bearer {KEYMASTER_TOKEN}"},
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Failed to fetch Shopify API key")
-    data = resp.json()
-    return data.get("key") or data.get("value") or ""
+app.include_router(webhook_router)
 
 
 def build_body_html(title: str, description: str) -> str:
@@ -48,7 +34,7 @@ async def health():
 
 @app.get("/products")
 async def list_products():
-    api_key = await get_shopify_api_key()
+    api_key = await get_key("shopify", "api_key")
     if not SHOPIFY_STORE:
         raise HTTPException(status_code=500, detail="SHOPIFY_STORE not configured")
     async with httpx.AsyncClient(timeout=15) as client:
@@ -71,7 +57,7 @@ async def create_product(
     price: str = Form("0"),
     image: UploadFile = File(...),
 ):
-    api_key = await get_shopify_api_key()
+    api_key = await get_key("shopify", "api_key")
     if not SHOPIFY_STORE:
         raise HTTPException(status_code=500, detail="SHOPIFY_STORE not configured")
 
