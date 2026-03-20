@@ -1,10 +1,10 @@
-"""Shopify webhook handler for sales notifications."""
+"""Stripe webhook handler for payment notifications."""
 
 import asyncio
-import base64
 import hashlib
 import hmac
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,48 +15,63 @@ from keymaster import get_key
 
 router = APIRouter(tags=["webhooks"])
 
-NOTION_PARENT_PAGE_ID = "329f46dbdd8d815aa79be904bde55141"
+NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+NOTION_DB_ID = "a8306831-049b-4bd4-a40e-791e00906228"
 TELEGRAM_CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
 
-
-def verify_shopify_signature(body: bytes, signature: str, secret: str) -> bool:
-    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
-    encoded = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(encoded, signature)
+STRIPE_SIGNATURE_TOLERANCE = 300
 
 
-def parse_order(payload: dict[str, Any]) -> dict[str, str]:
-    line_items = payload.get("line_items") or []
-    titles = [item.get("title", "作品名不明") for item in line_items]
-    total_price = payload.get("total_price") or "0"
-    currency = payload.get("currency") or "JPY"
-    order_name = payload.get("name") or f"#{payload.get('order_number', 'unknown')}"
-    created_at = payload.get("created_at") or datetime.now(timezone.utc).isoformat()
-    customer = payload.get("customer") or {}
-    customer_name = " ".join(
-        part for part in [customer.get("last_name"), customer.get("first_name")] if part
-    ).strip()
-    if not customer_name:
-        customer_name = customer.get("email") or "購入者情報なし"
+def verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> bool:
+    """Verify Stripe webhook signature (v1)."""
+    try:
+        elements = dict(
+            pair.split("=", 1) for pair in sig_header.split(",") if "=" in pair
+        )
+        timestamp = elements.get("t", "")
+        signature = elements.get("v1", "")
+        if not timestamp or not signature:
+            return False
+
+        if abs(time.time() - int(timestamp)) > STRIPE_SIGNATURE_TOLERANCE:
+            return False
+
+        signed_payload = f"{timestamp}.".encode() + payload
+        expected = hmac.new(
+            secret.encode("utf-8"), signed_payload, hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    except (ValueError, KeyError):
+        return False
+
+
+def parse_checkout_session(session: dict[str, Any]) -> dict[str, str]:
+    """Extract order details from a Stripe checkout.session.completed event."""
+    amount_total = session.get("amount_total") or 0
+    currency = (session.get("currency") or "jpy").upper()
+    customer_email = session.get("customer_details", {}).get("email", "")
+    customer_name = session.get("customer_details", {}).get("name", "")
+    payment_intent = session.get("payment_intent") or ""
+    session_id = session.get("id", "")
 
     return {
-        "order_id": str(payload.get("id", "")),
-        "order_name": order_name,
-        "titles": " / ".join(titles) if titles else "作品名不明",
-        "total_price": str(total_price),
+        "session_id": session_id,
+        "payment_intent": payment_intent,
+        "amount": str(amount_total),
         "currency": currency,
-        "created_at": created_at,
-        "customer_name": customer_name,
+        "customer_name": customer_name or customer_email or "購入者情報なし",
+        "customer_email": customer_email,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
 
 
 def build_telegram_message(order: dict[str, str]) -> str:
     return (
         "ビーズワークス売れました!\n"
-        f"作品名: {order['titles']}\n"
-        f"価格: {order['total_price']} {order['currency']}\n"
-        f"注文: {order['order_name']}\n"
+        f"金額: {order['amount']} {order['currency']}\n"
+        f"購入者: {order['customer_name']}\n"
+        f"Payment: {order['payment_intent']}\n"
         "次回イベントの制作費に還元して、さらにかわいい作品を届けます。"
     )
 
@@ -74,117 +89,82 @@ async def send_telegram_notification(order: dict[str, str]) -> None:
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             f"https://api.telegram.org/bot{telegram_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": build_telegram_message(order),
-            },
+            json={"chat_id": chat_id, "text": build_telegram_message(order)},
         )
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Telegram error: {resp.text}")
 
 
-def notion_rich_text(content: str) -> dict[str, Any]:
-    return {"type": "text", "text": {"content": content}}
-
-
 async def create_notion_sales_log(order: dict[str, str]) -> None:
-    notion_token = await get_key("notion", "api_key")
-    created_label = order["created_at"]
-    try:
-        created_label = datetime.fromisoformat(
-            order["created_at"].replace("Z", "+00:00")
-        ).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except ValueError:
-        pass
+    """Log the sale in the Notion DB."""
+    headers = {
+        "Authorization": f"Bearer {await get_key('notion', 'api_key')}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
 
-    payload = {
-        "parent": {"page_id": NOTION_PARENT_PAGE_ID},
+    payload: dict[str, Any] = {
+        "parent": {"database_id": NOTION_DB_ID},
         "properties": {
-            "title": {
+            "Name": {
                 "title": [
-                    notion_rich_text(
-                        f"売上ログ {order['order_name']} {order['titles']}"
-                    )
+                    {
+                        "text": {
+                            "content": f"売上 {order['customer_name']} {order['amount']} {order['currency']}"
+                        }
+                    }
                 ]
-            }
+            },
+            "Description": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": (
+                                f"Payment: {order['payment_intent']}\n"
+                                f"Session: {order['session_id']}\n"
+                                f"購入者: {order['customer_name']}\n"
+                                f"Email: {order['customer_email']}\n"
+                                f"日時: {order['created_at']}"
+                            )
+                        }
+                    }
+                ]
+            },
+            "Price": {"number": int(order["amount"])},
+            "Status": {"select": {"name": "Sold"}},
         },
-        "children": [
-            {
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [notion_rich_text("ビーズワークス売上通知")]
-                },
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [notion_rich_text(f"作品名: {order['titles']}")]
-                },
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [
-                        notion_rich_text(
-                            f"価格: {order['total_price']} {order['currency']}"
-                        )
-                    ]
-                },
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [notion_rich_text(f"注文: {order['order_name']}")]
-                },
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [notion_rich_text(f"購入者: {order['customer_name']}")]
-                },
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [notion_rich_text(f"受信日時: {created_label}")]
-                },
-            },
-        ],
     }
 
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
-            "https://api.notion.com/v1/pages",
-            headers={
-                "Authorization": f"Bearer {notion_token}",
-                "Notion-Version": NOTION_VERSION,
-                "Content-Type": "application/json",
-            },
+            f"{NOTION_API_BASE}/pages",
+            headers=headers,
             json=payload,
         )
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=502, detail=f"Notion error: {resp.text}")
 
 
-@router.post("/webhooks/orders/create")
-async def handle_orders_create(request: Request) -> dict[str, Any]:
+@router.post("/webhooks/stripe")
+async def handle_stripe_webhook(request: Request) -> dict[str, Any]:
+    """Handle Stripe webhook events (checkout.session.completed)."""
     body = await request.body()
-    signature = request.headers.get("X-Shopify-Hmac-Sha256", "")
-    if not signature:
-        raise HTTPException(status_code=401, detail="Missing Shopify signature")
+    sig_header = request.headers.get("Stripe-Signature", "")
+    if not sig_header:
+        raise HTTPException(status_code=401, detail="Missing Stripe-Signature header")
 
-    webhook_secret = await get_key("shopify", "webhook_secret")
-    if not verify_shopify_signature(body, signature, webhook_secret):
-        raise HTTPException(status_code=401, detail="Invalid Shopify signature")
+    webhook_secret = await get_key("stripe", "webhook_secret")
+    if not verify_stripe_signature(body, sig_header, webhook_secret):
+        raise HTTPException(status_code=401, detail="Invalid Stripe signature")
 
-    payload = await request.json()
-    order = parse_order(payload)
+    event = await request.json()
+    event_type = event.get("type", "")
+
+    if event_type != "checkout.session.completed":
+        return {"ok": True, "skipped": event_type}
+
+    session = event.get("data", {}).get("object", {})
+    order = parse_checkout_session(session)
 
     results = await asyncio.gather(
         send_telegram_notification(order),
@@ -201,9 +181,6 @@ async def handle_orders_create(request: Request) -> dict[str, Any]:
                 errors.append(f"{target}: {str(result)}")
 
     if errors:
-        raise HTTPException(
-            status_code=502,
-            detail="; ".join(errors),
-        )
+        raise HTTPException(status_code=502, detail="; ".join(errors))
 
-    return {"ok": True, "order": order["order_name"]}
+    return {"ok": True, "session_id": order["session_id"]}
