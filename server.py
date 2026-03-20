@@ -2,29 +2,52 @@
 
 import base64
 import os
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from keymaster import get_key
-from webhook_handler import router as webhook_router
-
-app = FastAPI(title="Akari Beads Shop")
-
 SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "")
-app.include_router(webhook_router)
+KEYMASTER_URL = os.environ.get("AKARI_KEYMASTER_URL", "")
+KEYMASTER_TOKEN = os.environ.get("AKARI_KEYMASTER_TOKEN", "")
+
+_http: httpx.AsyncClient | None = None
 
 
-def build_body_html(title: str, description: str) -> str:
-    return f"""<div style="font-family: sans-serif;">
-<h2>{title}</h2>
-<p>{description}</p>
-<hr>
-<p><strong>きらきらあかりん食堂</strong>へようこそ！</p>
-<p>ひとつひとつ心を込めて手作りしたビーズアクセサリーをお届けします。</p>
-<p>あかりんの世界観をまとった、きらきら輝くアイテムたち。</p>
-</div>"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http
+    _http = httpx.AsyncClient(timeout=30)
+    yield
+    await _http.aclose()
+
+
+app = FastAPI(title="Akari Beads Shop", lifespan=lifespan)
+
+
+async def _get_shopify_key() -> str:
+    resp = await _http.get(
+        f"{KEYMASTER_URL}/vault/api-key",
+        params={"api_name": "shopify", "key_name": "api_key"},
+        headers={"Authorization": f"Bearer {KEYMASTER_TOKEN}"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(502, "Failed to fetch Shopify API key from Keymaster")
+    return resp.json()["value"]
+
+
+def _body_html(title: str, description: str) -> str:
+    return (
+        '<div style="font-family: sans-serif;">'
+        f"<h2>{title}</h2>"
+        f"<p>{description}</p>"
+        "<hr>"
+        "<p><strong>きらきらあかりん食堂</strong>へようこそ！</p>"
+        "<p>ひとつひとつ心を込めて手作りしたビーズアクセサリーをお届けします。</p>"
+        "<p>あかりんの世界観をまとった、きらきら輝くアイテムたち。</p>"
+        "</div>"
+    )
 
 
 @app.get("/health")
@@ -34,19 +57,13 @@ async def health():
 
 @app.get("/products")
 async def list_products():
-    api_key = await get_key("shopify", "api_key")
-    if not SHOPIFY_STORE:
-        raise HTTPException(status_code=500, detail="SHOPIFY_STORE not configured")
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json",
-            headers={
-                "X-Shopify-Access-Token": api_key,
-                "Content-Type": "application/json",
-            },
-        )
+    api_key = await _get_shopify_key()
+    resp = await _http.get(
+        f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json",
+        headers={"X-Shopify-Access-Token": api_key},
+    )
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        raise HTTPException(resp.status_code, resp.text)
     return resp.json()
 
 
@@ -55,21 +72,14 @@ async def create_product(
     title: str = Form(...),
     description: str = Form(""),
     price: str = Form("0"),
-    image: UploadFile = File(...),
+    image: UploadFile = File(None),
 ):
-    api_key = await get_key("shopify", "api_key")
-    if not SHOPIFY_STORE:
-        raise HTTPException(status_code=500, detail="SHOPIFY_STORE not configured")
-
-    image_data = await image.read()
-    image_b64 = base64.b64encode(image_data).decode()
-
-    body_html = build_body_html(title, description)
+    api_key = await _get_shopify_key()
 
     payload = {
         "product": {
             "title": title,
-            "body_html": body_html,
+            "body_html": _body_html(title, description),
             "variants": [
                 {
                     "price": price,
@@ -77,32 +87,23 @@ async def create_product(
                     "inventory_quantity": 1,
                 }
             ],
-            "images": [
-                {
-                    "attachment": image_b64,
-                    "filename": image.filename or "product.jpg",
-                }
-            ],
         }
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json",
-            headers={
-                "X-Shopify-Access-Token": api_key,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+    if image:
+        image_b64 = base64.b64encode(await image.read()).decode()
+        payload["product"]["images"] = [
+            {"attachment": image_b64, "filename": image.filename or "product.jpg"}
+        ]
 
+    resp = await _http.post(
+        f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json",
+        headers={
+            "X-Shopify-Access-Token": api_key,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
     if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
+        raise HTTPException(resp.status_code, resp.text)
     return JSONResponse(status_code=201, content=resp.json())
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8787)
