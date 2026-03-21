@@ -14,7 +14,7 @@ app = FastAPI(title="Akari Beads Shop")
 STRIPE_API_BASE = "https://api.stripe.com/v1"
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
-NOTION_DB_ID = "a8306831-049b-4bd4-a40e-791e00906228"
+NOTION_DB_ID = "d7776580-7061-4405-9abb-3f4efa7e3b30"
 
 app.include_router(webhook_router)
 
