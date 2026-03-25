@@ -1,141 +1,101 @@
-"""Akari Beads Shop - Stripe + Notion DB product management API."""
+"""Akari Beads Shop - Shopify商品自動登録API.
 
+ビーズワークスの写真を撮ってShopifyに即登録するサービス。
+Keymaster経由でShopify Admin APIトークンを取得。
+"""
+
+import base64
+import os
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from keymaster import get_key
-from webhook_handler import router as webhook_router
 
 app = FastAPI(title="Akari Beads Shop")
 
-STRIPE_API_BASE = "https://api.stripe.com/v1"
-NOTION_API_BASE = "https://api.notion.com/v1"
-NOTION_VERSION = "2022-06-28"
-NOTION_DB_ID = "d7776580-7061-4405-9abb-3f4efa7e3b30"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-app.include_router(webhook_router)
-
-
-async def _stripe_headers() -> dict[str, str]:
-    api_key = await get_key("stripe", "api_key")
-    return {"Authorization": f"Bearer {api_key}"}
+SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
+SHOPIFY_API_VERSION = "2024-01"
 
 
-async def _notion_headers() -> dict[str, str]:
-    token = await get_key("notion", "api_key")
+def _shopify_base_url() -> str:
+    if not SHOPIFY_STORE_DOMAIN:
+        raise HTTPException(status_code=500, detail="SHOPIFY_STORE_DOMAIN not configured")
+    return f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}"
+
+
+async def _shopify_headers() -> dict[str, str]:
+    token = await get_key("shopify", "api_key")
     return {
-        "Authorization": f"Bearer {token}",
-        "Notion-Version": NOTION_VERSION,
+        "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
 
 
+@app.get("/")
+async def root():
+    return {"service": "Akari Beads Shop", "status": "ok"}
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """ヘルスチェック（Keymaster接続確認含む）."""
+    checks: dict[str, str] = {"service": "ok"}
+
+    # Keymaster connectivity
+    try:
+        await get_key("shopify", "api_key")
+        checks["keymaster"] = "ok"
+    except Exception as e:
+        checks["keymaster"] = f"error: {e}"
+
+    # Shopify domain
+    checks["shopify_domain"] = SHOPIFY_STORE_DOMAIN or "not configured"
+
+    status_code = 200 if checks.get("keymaster") == "ok" and SHOPIFY_STORE_DOMAIN else 503
+    return JSONResponse(status_code=status_code, content=checks)
 
 
 @app.get("/products")
 async def list_products():
-    """List products from Notion DB."""
-    headers = await _notion_headers()
+    """登録済みビーズワークス一覧."""
+    base = _shopify_base_url()
+    headers = await _shopify_headers()
+
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{NOTION_API_BASE}/databases/{NOTION_DB_ID}/query",
+        resp = await client.get(
+            f"{base}/products.json",
             headers=headers,
-            json={},
+            params={"limit": 50, "status": "active"},
         )
+
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
 
+    data = resp.json()
+    products = []
+    for p in data.get("products", []):
+        image = p.get("images", [{}])[0] if p.get("images") else {}
+        products.append({
+            "product_id": p["id"],
+            "title": p["title"],
+            "description": p.get("body_html", ""),
+            "price": p.get("variants", [{}])[0].get("price", "0") if p.get("variants") else "0",
+            "url": f"https://{SHOPIFY_STORE_DOMAIN}/products/{p.get('handle', '')}",
+            "image_url": image.get("src", ""),
+        })
 
-async def _create_stripe_product(title: str, description: str) -> dict[str, Any]:
-    """Create a Stripe Product."""
-    headers = await _stripe_headers()
-    data = {"name": title, "description": description}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{STRIPE_API_BASE}/products",
-            headers=headers,
-            data=data,
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-async def _create_stripe_price(product_id: str, price_yen: int) -> dict[str, Any]:
-    """Create a Stripe Price for a product (JPY)."""
-    headers = await _stripe_headers()
-    data = {
-        "product": product_id,
-        "unit_amount": str(price_yen),
-        "currency": "jpy",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{STRIPE_API_BASE}/prices",
-            headers=headers,
-            data=data,
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-async def _create_payment_link(price_id: str) -> dict[str, Any]:
-    """Create a Stripe Payment Link."""
-    headers = await _stripe_headers()
-    data = {
-        "line_items[0][price]": price_id,
-        "line_items[0][quantity]": "1",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{STRIPE_API_BASE}/payment_links",
-            headers=headers,
-            data=data,
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-async def _register_notion_product(
-    title: str,
-    description: str,
-    price_yen: int,
-    stripe_product_id: str,
-    payment_link_url: str,
-) -> dict[str, Any]:
-    """Register a product in the Notion DB."""
-    headers = await _notion_headers()
-    payload: dict[str, Any] = {
-        "parent": {"database_id": NOTION_DB_ID},
-        "properties": {
-            "Name": {"title": [{"text": {"content": title}}]},
-            "Description": {"rich_text": [{"text": {"content": description}}]},
-            "Price": {"number": price_yen},
-            "Stripe Product ID": {
-                "rich_text": [{"text": {"content": stripe_product_id}}]
-            },
-            "Payment Link": {"url": payment_link_url},
-            "Status": {"select": {"name": "Active"}},
-        },
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            f"{NOTION_API_BASE}/pages",
-            headers=headers,
-            json=payload,
-        )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Notion error: {resp.text}")
-    return resp.json()
+    return {"products": products, "count": len(products)}
 
 
 @app.post("/products/create")
@@ -143,40 +103,94 @@ async def create_product(
     title: str = Form(...),
     description: str = Form(""),
     price: str = Form("0"),
-    image: UploadFile | None = File(None),
+    creator_name: str = Form(""),
+    event_name: str = Form(""),
+    event_date: str = Form(""),
+    photo: UploadFile | None = File(None),
 ):
-    """Create a Stripe product + price + payment link, register in Notion DB."""
-    price_yen = int(price)
+    """写真+商品情報を受け取り、Shopify商品を作成する."""
+    base = _shopify_base_url()
+    headers = await _shopify_headers()
 
-    # 1. Create Stripe Product
-    product = await _create_stripe_product(title, description)
-    product_id = product["id"]
+    # Build body_html with metadata
+    body_parts = []
+    if description:
+        body_parts.append(f"<p>{description}</p>")
+    if creator_name:
+        body_parts.append(f"<p>つくった人: {creator_name}</p>")
+    if event_name:
+        body_parts.append(f"<p>イベント: {event_name}</p>")
+    if event_date:
+        body_parts.append(f"<p>イベント日: {event_date}</p>")
+    body_html = "\n".join(body_parts) if body_parts else ""
 
-    # 2. Create Stripe Price
-    stripe_price = await _create_stripe_price(product_id, price_yen)
-    price_id = stripe_price["id"]
+    # Build product payload
+    product_payload: dict[str, Any] = {
+        "product": {
+            "title": title,
+            "body_html": body_html,
+            "vendor": "Akari Beads Workshop",
+            "product_type": "ビーズワークス",
+            "status": "active",
+            "variants": [
+                {
+                    "price": price,
+                    "inventory_management": None,
+                    "requires_shipping": True,
+                }
+            ],
+            "tags": ", ".join(
+                t for t in [
+                    "beadworks",
+                    creator_name,
+                    event_name,
+                ] if t
+            ),
+        }
+    }
 
-    # 3. Create Payment Link
-    payment_link = await _create_payment_link(price_id)
-    payment_url = payment_link["url"]
+    # If photo provided, encode as base64 for Shopify image upload
+    image_b64 = None
+    if photo:
+        photo_bytes = await photo.read()
+        if photo_bytes:
+            image_b64 = base64.b64encode(photo_bytes).decode("utf-8")
+            product_payload["product"]["images"] = [
+                {
+                    "attachment": image_b64,
+                    "filename": photo.filename or "beadwork.jpg",
+                    "alt": title,
+                }
+            ]
 
-    # 4. Register in Notion DB
-    notion_page = await _register_notion_product(
-        title=title,
-        description=description,
-        price_yen=price_yen,
-        stripe_product_id=product_id,
-        payment_link_url=payment_url,
-    )
+    # Create product
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{base}/products.json",
+            headers=headers,
+            json=product_payload,
+        )
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    product = resp.json().get("product", {})
+    product_id = product.get("id")
+    handle = product.get("handle", "")
+    product_url = f"https://{SHOPIFY_STORE_DOMAIN}/products/{handle}"
+    image_url = ""
+    if product.get("images"):
+        image_url = product["images"][0].get("src", "")
 
     return JSONResponse(
         status_code=201,
         content={
-            "stripe_product_id": product_id,
-            "stripe_price_id": price_id,
-            "payment_link": payment_url,
-            "notion_page_id": notion_page.get("id", ""),
+            "status": "created",
+            "product_id": product_id,
             "title": title,
+            "url": product_url,
+            "image_url": image_url,
+            "message": f"✨ 「{title}」がショップに並びました！",
         },
     )
 
@@ -184,4 +198,4 @@ async def create_product(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8788)
+    uvicorn.run(app, host="0.0.0.0", port=8787)

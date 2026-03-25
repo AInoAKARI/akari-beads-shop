@@ -19,5 +19,11 @@ fi
 export AKARI_KEYMASTER_URL
 export AKARI_KEYMASTER_TOKEN
 
+# Shopify store domain (override via env or set here)
+export SHOPIFY_STORE_DOMAIN="${SHOPIFY_STORE_DOMAIN:-}"
+if [[ -z "${SHOPIFY_STORE_DOMAIN}" ]]; then
+    echo "WARNING: SHOPIFY_STORE_DOMAIN not set. Set it before creating products." >&2
+fi
+
 cd "$(dirname "$0")"
 exec uvicorn server:app --host 0.0.0.0 --port 8787
