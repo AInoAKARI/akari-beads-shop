@@ -7,6 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py keymaster.py ./
 
-EXPOSE 8787
+EXPOSE 8788
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8788"]
