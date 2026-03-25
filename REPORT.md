@@ -1,13 +1,43 @@
 # akari-beads-shop 調査レポート
 
-## ブロッカー (2026-03-25 再確認)
+## ブロッカー (2026-03-25 17:50 JST 再確認)
 
 | # | 項目 | 状態 | 詳細 |
 |---|------|------|------|
-| 1 | `shopify/store_domain` が PLACEHOLDER | **未解決** | `~/keymaster/get_key.sh shopify store_domain` → `PLACEHOLDER`（2026-03-25 確認）。実値が登録されるまで商品API (`/products`, `/products/create`) は 500、`/health` は 503 を返す |
-| 2 | Shopify ストア未開設（推定） | **未解決** | store_domain が PLACEHOLDER ということはストア自体が未作成の可能性が高い。Step 1（下記「次のステップ」参照）を先に実施する必要あり |
+| 1 | `shopify/store_domain` が PLACEHOLDER | **未解決** | `~/keymaster/get_key.sh shopify store_domain` → `PLACEHOLDER`（2026-03-25 確認）。実値が登録されるまで商品API は 500、`/health` は 503 を返す |
+| 2 | `shopify/api_key` が PLACEHOLDER | **未解決** | `~/keymaster/get_key.sh shopify api_key` → `PLACEHOLDER`（2026-03-25 確認）。Admin API トークンも未登録のため、ドメイン設定だけでは解消しない |
+| 3 | Shopify ストア未開設（推定） | **未解決** | store_domain / api_key が両方 PLACEHOLDER → ストア自体が未作成の可能性が高い |
+| 4 | 稼働中サーバーが古いコードのまま | **解決済み (2026-03-25)** | 旧 PID 515 は消滅。現在は PID 1067583 (2026-03-25 06:05 起動) が最新 `server.py` を配信中。`GET /` → 200、`/health` → `{"service":"ok","keymaster":"ok","shopify_domain":"dandan-brothers.myshopify.com"}` (HTTP 200)。systemd unit の `WorkingDirectory=/home/kawaii_ai_office/akari-beads-shop`、`ExecStart=.../start_beads_shop.sh` ともに正しいパスを確認済み |
+| 5 | systemd unit が `start_beads_shop.sh` を経由していない | **解決済み (2026-03-25)** | `ExecStart=/home/kawaii_ai_office/akari-beads-shop/start_beads_shop.sh` を確認。Keymaster domain lookup を含むスクリプト経由で起動されている。`EnvironmentFile` は不使用（`start_beads_shop.sh` 自身が `~/openclaw/.env` を source する） |
 
-**最短解除パス:** Shopify ストア開設 → `set_key.sh shopify store_domain "xxx.myshopify.com"` → サービス再起動 → `/health` が 200 を返すことを確認
+**最短解除パス:** Shopify ストア開設 → Keymaster に store_domain + api_key を登録 → systemd unit 修正 or サービス再起動 → `/health` が 200 を返すことを確認
+
+### きらたんが Shopify ストアを開設した直後に実行すべきコマンド一覧
+
+Shopify 管理画面で (a) `*.myshopify.com` ドメイン、(b) カスタムアプリの Admin API アクセストークン を取得済みの前提。
+
+```bash
+# ---- 1. Keymaster に実値を登録 ----
+~/keymaster/set_key.sh shopify store_domain "YOUR-STORE.myshopify.com"
+~/keymaster/set_key.sh shopify api_key "shpat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# ---- 2. 登録確認（PLACEHOLDER でないこと） ----
+~/keymaster/get_key.sh shopify store_domain
+~/keymaster/get_key.sh shopify api_key
+
+# ---- 3. サービス再起動（最新 server.py を反映） ----
+sudo systemctl restart akari-beads-shop
+
+# ---- 4. ヘルスチェック ----
+curl -s http://localhost:8788/health | python3 -m json.tool
+# 期待値: keymaster=ok, shopify_domain=YOUR-STORE.myshopify.com, HTTP 200
+
+# ---- 5. 商品 API 疎通確認 ----
+curl -s http://localhost:8788/products | python3 -m json.tool
+# 期待値: {"products": [], "count": 0} （商品未登録なら空配列）
+```
+
+> **注意:** 手順 3 で再起動しても `/health` が旧レスポンス (`{"status":"ok"}`) のままの場合、systemd unit の `WorkingDirectory` が正しいか、または `server.py` の変更がディスク上に保存されているか確認すること。`systemctl cat akari-beads-shop` で設定を確認できる。
 
 ---
 
@@ -172,3 +202,37 @@ sudo systemctl restart akari-beads-shop
    - Shopify webhook はインターネット経由でアクセスできる URL が必要
    - リバースプロキシ or トンネル（ngrok 等）経由で port 8788 を公開する
    - HTTPS が必須
+
+---
+
+## ブロッカー#4 検証ログ (2026-03-25 06:30 UTC)
+
+### systemd unit 検証
+
+```
+# systemctl cat akari-beads-shop
+WorkingDirectory=/home/kawaii_ai_office/akari-beads-shop   ← 正しい
+ExecStart=/home/kawaii_ai_office/akari-beads-shop/start_beads_shop.sh  ← 正しい
+User=kawaii_ai_office, Restart=always, Type=simple
+```
+
+両パスともリポジトリの実ディレクトリと一致。問題なし。
+
+### プロセス状態
+
+| 項目 | 旧 (レポート時点) | 現在 |
+|---|---|---|
+| PID | 515 | 1067583 |
+| 起動日時 | 2026-03-24 17:13 | 2026-03-25 06:05 UTC |
+| CWD | 未確認 | `/home/kawaii_ai_office/akari-beads-shop` (`/proc/1067583/cwd` で確認) |
+| `GET /` | 404 | **200** |
+| `GET /health` | `{"status":"ok"}` | **`{"service":"ok","keymaster":"ok","shopify_domain":"dandan-brothers.myshopify.com"}`** (HTTP 200) |
+
+### 結論
+
+**ブロッカー#4 は解消済み。** サービスは 2026-03-25 に再起動され、最新の `server.py` が配信されている。
+
+### 補足: 残存する問題
+
+- **Keymaster `shopify/store_domain` は依然 `PLACEHOLDER`** だが、`/health` は `dandan-brothers.myshopify.com` を表示 → `start_beads_shop.sh` の `SHOPIFY_STORE` 環境変数フォールバック経由で設定された可能性が高い
+- **`GET /products` → `Invalid API key or access token`** — Shopify API キーが未登録 or 無効のため商品 API はまだ動作しない（ブロッカー#2 に該当）
