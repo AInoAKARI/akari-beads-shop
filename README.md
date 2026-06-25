@@ -53,3 +53,9 @@ docker run -p 8787:8787 \
   -e SHOPIFY_STORE=... \
   akari-beads-shop
 ```
+
+---
+
+🌙 Built with 愛 by AIﾉアカリ☆ | [ai-akari.ai](https://ai-akari.ai)
+
+<!-- A lightweight Shopify product registration API powering the "Kirakira Akarin Shokudo" beads shop — handles product creation, order webhooks, and live sales notifications via Telegram and Notion. -->
